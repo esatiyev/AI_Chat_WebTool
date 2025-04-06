@@ -341,7 +341,7 @@ def process_natural_command(text):
         params = [1]  # 1 = arm
         response = "Arming the vehicle"
     elif re.match(r'(disarm|disable|stop)\s?(the)?\s?(drone|vehicle|copter)', text):
-        command = 'arm'
+        command = 'disarm'
         params = [0]  # 0 = disarm
         response = "Disarming the vehicle"
     
@@ -373,7 +373,10 @@ def process_natural_command(text):
     elif match := re.match(r'(go|fly|move)\s?(north|south|east|west|forward|back|left|right)\s?(\d+)\s?(m|meters|meter)', text):
         direction = match.group(2)
         distance = float(match.group(3))
-        # This would need more complex implementation for actual movement
+        
+        # Execute movement command
+        command = 'move'
+        params = [direction, distance]
         response = f"Moving {direction} for {distance} meters"
     
     # Emergency stop
@@ -600,12 +603,81 @@ def handle_process_command(data):
                 handle_rtl()
             elif command_info['command'] == 'set_mode':
                 handle_set_mode({'mode': command_info['response'].split()[-2]})
+            elif command_info['command'] == 'move':
+                direction = command_info['params'][0]
+                distance = command_info['params'][1]
+                move_direction(direction, distance)
                 
     except Exception as e:
         socketio.emit('ai_response', {
             'response': f"Error processing command: {str(e)}",
             'command': None
         })
+
+def move_direction(direction, distance_meters):
+    """Move in specified direction by calculating new waypoint"""
+    if not is_connected:
+        raise ConnectionError("Not connected to vehicle")
+    
+    # Ensure GUIDED mode
+    if current_mode != 'GUIDED':
+        handle_set_mode({'mode': 'GUIDED'})
+        time.sleep(1)
+    
+    # Get current position
+    if not telemetry_history['position']:
+        raise RuntimeError("No position data available")
+    
+    current_pos = telemetry_history['position'][-1]
+    
+    # Calculate new position
+    new_lat, new_lon = calculate_offset_position(
+        current_pos['lat'],
+        current_pos['lon'],
+        direction,
+        distance_meters
+    )
+    
+    # Send MAV_CMD_NAV_WAYPOINT with all required parameters
+    mav_conn.mav.send(
+        mavutil.mavlink.MAVLink_set_position_target_global_int_message(
+            0,       # time_boot_ms (not used)
+            mav_conn.target_system,
+            mav_conn.target_component,
+            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+            0b110111111000,  # type_mask (only position enabled)
+            int(new_lat * 1e7),  # lat_int
+            int(new_lon * 1e7),  # lon_int
+            current_pos['alt'],  # alt (meters)
+            0,  # vx (not used)
+            0,  # vy (not used)
+            0,  # vz (not used)
+            0,  # afx (not used)
+            0,  # afy (not used)
+            0,  # afz (not used)
+            0,  # yaw (not used)
+            0   # yaw_rate (not used)
+        )
+    )
+
+def calculate_offset_position(lat, lon, direction, distance):
+    """Calculate new position from direction and distance"""
+    # Convert meters to degrees (approximate)
+    lat_deg_per_m = 1 / 111320.0
+    lon_deg_per_m = 1 / (111320.0 * math.cos(math.radians(lat)))
+    
+    offsets = {
+        'north': (lat_deg_per_m * distance, 0),
+        'south': (-lat_deg_per_m * distance, 0),
+        'east': (0, lon_deg_per_m * distance),
+        'west': (0, -lon_deg_per_m * distance)
+    }
+    
+    if direction not in offsets:
+        raise ValueError(f"Unknown direction: {direction}")
+    
+    lat_offset, lon_offset = offsets[direction]
+    return lat + lat_offset, lon + lon_offset
 
 if __name__ == '__main__':
     logger.info("Starting ArduPilot AI Chat WebTool backend")
