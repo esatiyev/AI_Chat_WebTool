@@ -8,12 +8,27 @@ import re
 from collections import deque
 import logging
 
+import google.generativeai as genai
+import json
+from functools import lru_cache
+import os
+
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*")
+
+# GEMINI_API_KEY = os.getenv("REMOVED")
+GEMINI_API_KEY = "REMOVED"
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    ai_model = genai.GenerativeModel('gemini-1.5-flash')
+else:
+    ai_model = None
+    logger.warning("GEMINI_API_KEY not set, using regex fallback only")
 
 # MAVLink connection and state
 mav_conn = None
@@ -35,6 +50,7 @@ telemetry_history = {
 # Command definitions
 COMMAND_MAPPING = {
     'arm': mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+    'disarm': mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
     'takeoff': mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
     'land': mavutil.mavlink.MAV_CMD_NAV_LAND,
     'rtl': mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH,
@@ -329,8 +345,20 @@ def check_arming_requirements():
         return {'status': False, 'error': f'Arming check failed: {str(e)}'}
 
 def process_natural_command(text):
-    """Process natural language command and return MAVLink command"""
+    """Process natural language command with AI fallback to regex"""
     text = text.lower().strip()
+    
+    # First try AI processing if available
+    if ai_model:
+        try:
+            ai_result = ai_process_command(text)
+            if ai_result and ai_result["command"]:
+                return ai_result
+        except Exception as e:
+            logger.warning(f"AI processing attempt failed, falling back to regex: {str(e)}")
+            
+
+    # Fallback to regex processing
     response = ""
     command = None
     params = []
@@ -445,7 +473,7 @@ def handle_arm(data=None):
 def handle_disarm(data=None):
     """Handle disarm command"""
     try:
-        send_mavlink_command(COMMAND_MAPPING['arm'], [0])
+        send_mavlink_command(COMMAND_MAPPING['disarm'], [0])
         socketio.emit('command_ack', {
             'command': 'disarm',
             'result': 'SUCCESS',
@@ -678,6 +706,164 @@ def calculate_offset_position(lat, lon, direction, distance):
     
     lat_offset, lon_offset = offsets[direction]
     return lat + lat_offset, lon + lon_offset
+
+def ai_process_command(text):
+    """
+    Process natural language command using Gemini AI
+    Returns same format as process_natural_command() or None if AI fails
+    """
+    if not ai_model:
+        return None
+        
+    try:
+        # Build the constrained prompt
+        prompt = f"""
+        STRICT INSTRUCTIONS:
+        1. Output MUST be valid JSON with 'command' and 'params' keys
+        2. Map synonyms to these EXACT commands: {list(COMMAND_MAPPING.keys())}
+        
+        COMMAND MAPPING TABLE:
+        | User Says          | Output Command | Parameters          |
+        |--------------------|----------------|---------------------|
+        | arm/enable/start   | "arm"          | [1]                 |
+        | disarm/disable/stop| "disarm"       | [0]                 |
+        | take off X meters  | "takeoff"      | [0,0,0,0,0,0,X]     |
+        | move/go/fly DIR Xm | "move"         | ["DIR", X]          |
+        | land/descend       | "land"         | []                  |
+        | rtl/return/home    | "rtl"          | []                  |
+        | emergency stop     | "emergency_stop"| []                 |
+        | set/change mode    | "set_mode"     | ["MODE"]            |
+        DIR = [north, south, east, west]
+        FLIGHT_MODES = {list(FLIGHT_MODES.items())}
+        CURRENT INPUT: "{text}"
+        OUTPUT MUST BE VALID JSON:
+        """
+        
+        # Call Gemini with strict parameters
+        response = ai_model.generate_content(
+            prompt,
+            generation_config={
+                "temperature": 0.3,
+                "max_output_tokens": 200,
+                "response_mime_type": "application/json"
+            },
+            safety_settings={
+                'HARM_CATEGORY_HARASSMENT': 'BLOCK_NONE',
+                'HARM_CATEGORY_HATE_SPEECH': 'BLOCK_NONE'
+            }
+        )
+
+        print(f"Raw AI response: {response.text}")
+
+        # Parse and validate response
+        result = json.loads(response.text)
+        
+        # Ensure command is valid
+        if "command" not in result or ( result["command"] not in COMMAND_MAPPING and not result["command"] == "move" ):
+            raise ValueError(f"Invalid or missing command: {result.get('command')}")
+        
+        # Initialize params if not present
+        if "params" not in result:
+            result["params"] = []
+        
+        # Validate parameters based on command type
+        if result["command"] == "arm":
+            if not result["params"]:
+                result["params"] = [1]  # Default to arm if invalid
+        elif result["command"] == "takeoff":
+            if len(result["params"]) < 7:
+                # If altitude provided but not full params
+                if isinstance(text, str):
+                    # Find all numbers in the text
+                    numbers = re.findall(r'\d+', text)
+                    if numbers:
+                        alt = float(numbers[0])
+                        result["params"] = [0,0,0,0,0,0,alt]
+                    else:
+                        result["params"] = [0,0,0,0,0,0,10]  # Default altitude
+                else:
+                    result["params"] = [0,0,0,0,0,0,10]  # Default altitude
+        elif result["command"] == "move":
+            if len(result["params"]) < 2:
+                # Try to extract direction and distance from text
+                direction = "north"  # default
+                distance = 10  # default
+                
+                # Find direction
+                for d in ['north', 'south', 'east', 'west']:
+                    if d in text.lower():
+                        direction = d
+                        break
+                
+                # Find distance
+                numbers = re.findall(r'\d+', text)
+                if numbers:
+                    distance = float(numbers[0])
+                
+                result["params"] = [direction, distance]
+            else:
+                # convert distance to float
+                try:
+                    result["params"][1] = float(result["params"][1])
+                except ValueError:
+                    raise ValueError(f"Invalid distance: {result['params'][1]}")
+        elif result["command"] == "set_mode":
+            if len(result["params"]) < 1:
+                # Default to GUIDED mode
+                result["params"] = ["GUIDED"]
+            else:
+                # Validate mode
+                if result["params"][0] not in FLIGHT_MODES.values():
+                    raise ValueError(f"Invalid flight mode: {result['params'][0]}")
+                else:
+                    mode = result["params"][0].upper()
+                    # we dont need params in this case, so we can remove its value
+                    response = f"Changing to {mode} mode"
+                    return {
+                        'response': response,
+                        'command': result["command"],
+                        'params': []
+                    }
+
+        # Generate human-readable response
+        responses = {
+            'arm': "Arming the vehicle",
+            'disarm': "Disarming the vehicle",
+            'takeoff': f"Taking off to {result['params'][6] if len(result['params']) > 6 else 10} meters",
+            'move': f"Moving {result['params'][0] if len(result['params']) > 0 else 'north'} for {result['params'][1] if len(result['params']) > 1 else 10} meters",
+            'land': "Initiating landing sequence",
+            'rtl': "Returning to launch location",
+            'emergency_stop': "EMERGENCY: Killing motors!",
+            'set_mode': f"Changing to {result['params'][0] if len(result['params']) > 0 else 'GUIDED'} mode"
+        }
+        return {
+            'response': responses.get(result["command"], f"Executing: {result['command']}"),
+            'command': result["command"],
+            'params': result.get("params", [])
+        }
+        
+    except Exception as e:
+        logger.error(f"AI processing failed: {str(e)}")
+        return None
+
+def rate_limited(max_per_minute):
+    interval = 60.0 / max_per_minute
+    last_time = [0.0]
+    
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            elapsed = time.time() - last_time[0]
+            wait_time = interval - elapsed
+            if wait_time > 0:
+                time.sleep(wait_time)
+            last_time[0] = time.time()
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+if ai_model:
+    ai_process_command = rate_limited(max_per_minute=55)(ai_process_command)
+
 
 if __name__ == '__main__':
     logger.info("Starting ArduPilot AI Chat WebTool backend")
