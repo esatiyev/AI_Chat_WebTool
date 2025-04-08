@@ -724,7 +724,7 @@ def ai_process_command(text):
         STRICT INSTRUCTIONS:
         1. Output MUST be valid JSON with 'command' and 'params' keys
         2. Map synonyms to these EXACT commands: {list(COMMAND_MAPPING.keys())}
-        
+        3. User may use another language, but output MUST be in English
         COMMAND MAPPING TABLE:
         | User Says          | Output Command | Parameters          |
         |--------------------|----------------|---------------------|
