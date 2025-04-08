@@ -12,17 +12,20 @@ import google.generativeai as genai
 import json
 from functools import lru_cache
 import os
+from dotenv import load_dotenv
 
+# Load environment variables from .env file
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'default_secret_key')  # Use the SECRET_KEY from .env or a default value
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# GEMINI_API_KEY = os.getenv("REMOVED")
-GEMINI_API_KEY = "REMOVED"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
     ai_model = genai.GenerativeModel('gemini-1.5-flash')
