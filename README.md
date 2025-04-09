@@ -5,6 +5,10 @@ A web-based interface for controlling ArduPilot vehicles using natural language 
 
 ![Screenshot of the interface](https://github.com/user-attachments/assets/6e12e86f-2c6e-4344-8361-f308192300be)
 
+![Test video in English](https://drive.google.com/file/d/1wN9kWMyoYAuHjl2mkt9VDKbuwBiBTHmw/view?usp=sharing)
+
+![Türkcə Test Videosu](https://drive.google.com/file/d/1wRPwkOFIz_qkHjk4K3ee3zd9nOrUFpVG/view?usp=sharing)
+
 ## Features
 
 ### Core Functionality
